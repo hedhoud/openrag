@@ -1,0 +1,227 @@
+x-openrag: &openrag_template
+  image: ghcr.io/linagora/openrag:latest
+  build:
+    context: .
+    dockerfile: Dockerfile
+  volumes:
+    - ${CONFIG_VOLUME:-./.hydra_config}:/app/.hydra_config # For dev mode
+    - ${DATA_VOLUME:-./data}:/app/data
+    - ${MODEL_WEIGHTS_VOLUME:-~/.cache/huggingface}:/app/model_weights # Model weights for RAG
+    - ./openrag:/app/openrag # For dev mode
+    - /$SHARED_ENV:/ray_mount/.env # Shared environment variables
+    - ./logs:/app/logs # For dev mode
+  ports:
+    - ${APP_PORT:-8080}:${APP_iPORT:-8080}
+    - ${RAY_DASHBOARD_PORT:-8265}:8265 # Disable when in cluster mode
+    - ${CHAINLIT_PORT:-8090}:${CHAINLIT_PORT:-8090}
+  networks:
+    default:
+      aliases:
+        - openrag
+  env_file:
+    - ${SHARED_ENV:-.env}
+  shm_size: 10.24gb
+
+x-vllm: &vllm_template
+  networks:
+    default:
+      aliases:
+        - vllm
+  restart: on-failure
+  environment:
+    - HUGGING_FACE_HUB_TOKEN
+  ipc: "host"
+  volumes:
+    - ${VLLM_CACHE:-/root/.cache/huggingface}:/root/.cache/huggingface
+  command: >
+    --model ${EMBEDDER_MODEL_NAME:-jinaai/jina-embeddings-v3}
+    --trust-remote-code
+    --task embed
+    --gpu_memory_utilization 0.3
+    --max-model-len ${MAX_MODEL_LEN:-8194}
+  healthcheck:
+    test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+    interval: 20s
+    timeout: 5s
+    retries: 4
+    start_period: 90s
+
+x-reranker: &reranker_template
+  networks:
+    default:
+      aliases:
+        - reranker
+  volumes:
+    - ${VLLM_CACHE:-/root/.cache/huggingface}:/app/.cache/huggingface
+
+services:
+  # ========== OpenRAG Services ==========
+  indexer-ui:
+    image: linagoraai/indexer-ui:latest
+    build:
+      context: ./extern/indexer-ui
+      dockerfile: Dockerfile
+    environment:
+      - API_BASE_URL=${API_BASE_URL:-http://localhost:${APP_PORT:-8080}}
+      - INCLUDE_CREDENTIALS=${INCLUDE_CREDENTIALS:-false}
+    ports:
+      - "${INDEXERUI_PORT:-3042}:3000"
+    restart: unless-stopped
+
+  # GPU - default
+  openrag:
+    <<: *openrag_template
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    profiles:
+      - ""
+    depends_on:
+      rdb:
+        condition: service_started
+      milvus:
+        condition: service_healthy
+      vllm-gpu:
+        condition: service_healthy
+
+  # No GPU
+  openrag-cpu:
+    <<: *openrag_template
+    deploy: {}
+    profiles:
+      - "cpu"
+    depends_on:
+      rdb:
+        condition: service_started
+      milvus:
+        condition: service_healthy
+      vllm-cpu:
+        condition: service_healthy
+
+  # ========== Database ==========
+  rdb:
+    image: postgres:15
+    environment:
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-root_password}
+      - POSTGRES_USER=${POSTGRES_USER:-root}
+    volumes:
+      - ${DB_VOLUME:-./db}:/var/lib/postgresql/data
+
+  # ========== VLLM Services ==========
+  vllm-gpu:
+    <<: *vllm_template
+    image: vllm/vllm-openai:v0.9.2
+    runtime: nvidia
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    profiles:
+      - ""
+
+  vllm-cpu:
+    <<: *vllm_template
+    build:
+      context: extern/vllm
+      dockerfile: Dockerfile.cpu
+      target: vllm-openai
+    image: openrag-vllm-openai-cpu
+    deploy: {}
+    environment:
+      - VLLM_CPU_KVCACHE_SPACE=8
+    command: >
+      --model ${EMBEDDER_MODEL_NAME:-jinaai/jina-embeddings-v3}
+      --trust-remote-code
+      --dtype float32
+      --max-model-len ${MAX_MODEL_LEN:-8194}
+    profiles:
+      - "cpu"
+
+  # ========== Reranker Services ==========
+  reranker:
+    <<: *reranker_template
+    image: michaelf34/infinity
+    runtime: nvidia
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all 
+              capabilities: [gpu]
+    command: >
+      v2
+      --model-id ${RERANKER_MODEL:-Alibaba-NLP/gte-multilingual-reranker-base}
+      --port ${RERANKER_PORT:-7997}
+    profiles:
+      - ''
+
+  reranker-cpu:
+    <<: *reranker_template
+    image: michaelf34/infinity:latest-cpu
+    deploy: {}
+    command: >
+      v2
+      --engine torch
+      --model-id ${RERANKER_MODEL:-Alibaba-NLP/gte-multilingual-reranker-base}
+      --port ${RERANKER_PORT:-7997}
+    profiles:
+      - 'cpu'
+
+  # ========== Milvus Vector Database ==========
+  etcd:
+    image: quay.io/coreos/etcd:v3.5.16
+    environment:
+      - ETCD_AUTO_COMPACTION_MODE=revision
+      - ETCD_AUTO_COMPACTION_RETENTION=1000
+      - ETCD_QUOTA_BACKEND_BYTES=4294967296
+      - ETCD_SNAPSHOT_COUNT=50000
+    volumes:
+      - ${MILVUS_VOLUME_DIRECTORY:-./vdb/volumes}/etcd:/etcd
+    command: etcd -advertise-client-urls=http://127.0.0.1:2379 -listen-client-urls http://0.0.0.0:2379 --data-dir /etcd
+    healthcheck:
+      test: ["CMD", "etcdctl", "endpoint", "health"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+
+  minio:
+    image: minio/minio:RELEASE.2023-03-20T20-16-18Z
+    environment:
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
+    volumes:
+      - ${MILVUS_VOLUME_DIRECTORY:-./vdb/volumes}/minio:/minio_data
+    command: minio server /minio_data --console-address ":9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+
+  milvus:
+    image: milvusdb/milvus:v2.5.4
+    command: ["milvus", "run", "standalone"]
+    security_opt:
+    - seccomp:unconfined
+    environment:
+      ETCD_ENDPOINTS: etcd:2379
+      MINIO_ADDRESS: minio:9000
+    volumes:
+      - ${MILVUS_VOLUME_DIRECTORY:-./vdb/volumes}/milvus:/var/lib/milvus
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9091/healthz"]
+      interval: 30s
+      start_period: 90s
+      timeout: 20s
+      retries: 3
+    depends_on:
+      - "etcd"
+      - "minio"
